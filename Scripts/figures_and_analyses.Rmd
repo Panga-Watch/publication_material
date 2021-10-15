@@ -134,7 +134,7 @@ These are things I found in the code that need to be informed in the manuscript 
 3) Currency conversion 
 
 - 0.000071 USD / 1 Indonesian Rupiah 
-- 0.052 USD / 1 Medican Peso
+- 0.052 USD / 1 Mexican Peso
 
 4) Gapfilling
 
