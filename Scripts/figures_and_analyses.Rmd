@@ -1,0 +1,540 @@
+---
+title: "Assessing the drivers of vessel tracking systems adoption for improved small-scale fisheries management"
+date: "4/20/2021"
+output: 
+  html_document:
+      code_folding: hide
+      theme: cosmo
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(mlogit)
+library(survival)
+library(cobalt)
+library(gt)
+library(modelsummary)
+library(foreign)
+library(WDI)
+library(here)
+```
+
+```{r reading and organizing data, echo FALSE}
+
+# calling raw database
+
+raw_db <- read.csv(here("Data/master_survey_resp.csv"), stringsAsFactors = TRUE)
+
+# data for interval regression after Gage's cleaning
+
+interval_reg_db <- read.csv(here("Data/data_int_regression.csv"), stringsAsFactors = TRUE) %>% 
+# ordering variables
+  select(
+    survey_id,
+    survey_version, 
+    country, 
+    choice, 
+    package,
+    sos, 
+    info, 
+    own, 
+    community, 
+    years_fishing, 
+    age, 
+    boat_length_m, 
+    fishing_organization, 
+    education, 
+    gdp_prop, 
+    income_usd, 
+    NY.GDP.PCAP.KD, 
+    fishing_org_members, 
+    fishtech,
+    boat_own,
+    income_fishing,
+    rank_one,
+    wtp_upper,
+    wtp_lower
+  ) %>% 
+  mutate(data_owned = ifelse(own == 1, " by fisher", 
+                      ifelse(own == 2, " by industry", 
+                             ifelse(own == 3, " by goverment", "Public data"))))
+# releveling factors 
+
+interval_reg_db$data_owned <- fct_relevel(interval_reg_db$data_owned, c("Public data", " by industry", " by goverment", " by fisher"))
+interval_reg_db$education <- fct_relevel(interval_reg_db$education, c("no_formal", "formal", "higher"))
+interval_reg_db$rank_one <- fct_relevel(interval_reg_db$rank_one, c("corruption", "pollution", "weather", "iuu"))
+
+# data for clogit 
+
+master_survey <- read.csv(here("Data/master_survey_resp.csv"), stringsAsFactors = TRUE) %>%
+  select(
+    -(c(start, 
+        end, 
+        survey_type, 
+        interviewer, 
+        comment, 
+        text_vms_adoption, 
+        fishery_problem_one, 
+        fishery_problem_two, 
+        fishery_problem_three, 
+        fishery_solution_one, 
+        fishery_solution_two, 
+        fishery_solution_three, 
+        photo)))
+
+clogit_db <- read_csv(here("Data/data_clogit.csv")) %>%
+  left_join(master_survey, by = "survey_id") %>%
+  select(-noalt) %>%
+  mutate(own = as.factor(own)) %>% 
+  mutate(info = as.factor(info)) %>% 
+  #dummy variables column for country, indo = 1 mex = 0
+  mutate(country_dum = ifelse(country == 'IND', 1, 0)) %>%  
+  mutate(country_dum = as.factor(country_dum), 
+  data_owned = ifelse(own == 1, " by fisher", 
+                      ifelse(own == 2, " by industry", 
+                             ifelse(own == 3, " by goverment", "Public data"))),
+  sos = ifelse(sos == 1, "With", "Whithout"),
+  info = ifelse(info == 1, "Non-anonymous", "Anonymous")
+  )
+
+# reordering levels for info and ownership in clogit dataset
+
+clogit_db$data_owned <- fct_relevel(clogit_db$data_owned, c("Public data", " by fisher", " by industry", " by goverment"))
+clogit_db$info <- fct_relevel(clogit_db$info, c("Anonymous", "Non-anonymous"))
+
+
+```
+
+## **1. Data exploration**
+
+These are things I found in the code that need to be informed in the manuscript or suplemetary info.
+
+1) Willingness to pay intervals
+
+- For IND
+
+  - wtp_1 = $2.14
+  - wtp_2 = $3.56
+  - wtp_3 = $5.35
+  - wtp_4 = $7.12
+
+- For MEX 
+
+  - wtp_1 = $2.07
+  - wtp_2 = $3.62
+  - wtp_3 = $5.17
+  - wtp_4 = $7.75
+
+2) Income error in WKB
+
+- Huge distribution of income in IND, especially in WKB (10^7 difference) min is a single digit number, which does not make sense for Indonesia (Annual income for lowest income would be $0.0043) 
+
+3) Currency conversion 
+
+- 0.000071 USD / 1 Indonesian Rupiah 
+- 0.052 USD / 1 Medican Peso
+
+4) Gapfilling
+
+- gapfill means for each village for variable "fishing_org_members"... except for MNC.. gapfill with overall indonesia mean  61.86538 is the average fishing org size from survey in IND round up to 62 
+
+
+### **1.a. Summary stats ** {.tabset}
+
+```{r balance table continous, echo = FALSE, message=FALSE, warning=FALSE}
+
+
+# to adjust for income (Gage's code)
+
+## gdp per capita per country
+
+gdp_raw <- WDI(indicator = "NY.GDP.PCAP.KD", country=c("MX", "ID"), start = 2018, end = 2018) %>% 
+  mutate(country = ifelse(country=="Mexico", "MEX", "IND")) %>% 
+  dplyr::rename(c = 1) %>% 
+  select(-c, -year)
+
+# data summary for raw database continous variables (without excluding observations with no WTP)
+
+raw_db_summary_con <- raw_db %>% 
+  left_join(gdp_raw, by = "country") %>% 
+    mutate(
+    income = ifelse(country == "IND" & income <= 10, income*1000000, income), # from Gage's code
+    rep_annual_income_usd = ifelse(country == "MEX", income*0.052*12, income*0.000071*12),
+    adj_annual_income_usd = rep_annual_income_usd/NY.GDP.PCAP.KD) %>% 
+  group_by(country) %>%
+  summarise(
+    mean_age = mean(age, na.rm = T),
+    sd_age = sd(age, na.rm = T), 
+    mean_boat_length = mean(boat_length_m, na.rm = T),
+    sd_boat_length = sd(boat_length_m, na.rm = T),
+    mean_rep_income_usd = mean(rep_annual_income_usd, na.rm =T),
+    sd_rep_income_usd = sd(rep_annual_income_usd, na.rm = T),
+    mean_adj_income_usd = mean(adj_annual_income_usd, na.rm =T),
+    sd_adj_income_usd = sd(adj_annual_income_usd, na.rm = T),
+    mean_income_fishing = mean(income_fishing, na.rm =T),
+    sd_income = sd(income_fishing, na.rm = T)) %>% 
+  mutate_at(2:11, round, 1)
+ 
+# data summary for raw database count variables (without excluding observations with no WTP)
+
+count_org_fishers <- raw_db %>% 
+  group_by(country) %>%
+  count(fishing_organization) %>% 
+  mutate(total = sum(n),
+         percent= n*100/total) %>% 
+  mutate_at(5, round, 1)
+
+count_education <- raw_db %>% 
+  mutate(education = case_when(
+    education == "no_formal" ~ "no_formal",
+    education == "primary" | education == "secondary" ~ "formal",
+    education == "university" | education == "vocational" ~ "higher"
+  )) %>%
+  group_by(country) %>%
+  count(education) %>% 
+  mutate(total = sum(n),
+         percent= n*100/total) %>% 
+  mutate_at(5, round, 1)
+ 
+  
+count_tech <- raw_db %>% 
+  group_by(country) %>%
+  mutate(fishtech = ifelse(fishtech_none == 1, 0, 1),
+         fishtech = ifelse(is.na(fishtech_none), 0, fishtech)) %>%
+        mutate(fishtech = ifelse(fishtech_vhf == 1 & fishtech == 0, 1, fishtech),
+               fishtech = ifelse(is.na(fishtech_vhf), 0 , fishtech)) %>% 
+  count(fishtech) %>% 
+  mutate(total = sum(n),
+         percent= n*100/total) %>% 
+  mutate_at(5, round, 1)
+ 
+
+# Balance of continuous covariates with 
+
+var <- interval_reg_db %>% 
+  select(-(c(survey_id,
+    survey_version, 
+    choice, 
+    package,
+    sos, 
+    info, 
+    own, 
+    community))) %>% 
+  mutate(fishtech = as.character(ifelse(fishtech ==1, "y", "n")),
+         boat_own = as.character(ifelse(boat_own == 1, "y", "n")))
+
+data_summary <- datasummary_balance(~country, var, dinm =T, dinm_statistic = "p.value", fmt = 2)
+
+# printing balance table with t-tests for continuous variables
+data_summary
+
+# Summarizing reported monthly income converted to USD and annual income (before adjusting for GDP)
+
+reported_income_summary <- raw_db %>%
+  select(survey_id, income) %>% 
+  right_join(interval_reg_db, by = "survey_id") %>% 
+  group_by(country) %>% 
+  summarise(mean_income = mean(income, na.rm =T),
+            sd_income = sd(income, na.rm = T)) %>% 
+  mutate(
+    mean_annual_income_usd = ifelse(country == "MEX", mean_income*0.052*12, mean_income*0.000071*12),
+    sd_annual_income_usd = ifelse(country == "MEX", sd_income*0.052*12, sd_income*0.000071*12),
+  )
+
+```
+
+## **2. Conditional logit regression to analyze preferences on attributes** {.tabset}
+
+- We do not need to account for country differences here because the clogit controls for subjects fixed characteristics. 
+- The conditional logit assumes homogeneous preferences across respondents. It accounts for demographics but assumes that preferences are constant. If we would like to allowed for heterogenous preferences we would need to apply a [Random Paramater Logit](https://cran.r-project.org/web/packages/mlogit/vignettes/c5.mxl.html). 
+
+```{r conditional logit, echo = FALSE, warning = FALSE, message= FALSE, warning= FALSE}
+
+clogit_db <- clogit_db %>% 
+  mutate(indo = ifelse(country == "IND", 1, 0))
+
+models_clogit <- list(
+  
+  clogit = clogit(RES ~ sos + info + data_owned + strata(STR), data=clogit_db),
+  clogit_only_ind = clogit(RES ~ sos + info + data_owned + strata(STR), data=filter(clogit_db, country == "IND")),
+  clogit_only_mex = clogit(RES ~ sos + info + data_owned + strata(STR), data=filter(clogit_db, country == "MEX")),
+  clogit_country_attribute_interaction = clogit(RES ~ interaction(sos,country) + interaction(info, country) + interaction(data_owned, country) + strata(STR), data= clogit_db), 
+  clogit_country_attribute_interaction_ii = clogit(RES ~ sos + info + data_owned + indo + sos*indo + info*indo + data_owned*indo + strata(STR), data= clogit_db) 
+  
+)
+
+# printing models with clustered standard errors by community
+
+modelsummary(models_clogit, estimate= "{estimate}{stars}", statistic = 'conf.int')
+
+# Computing McFadden’s R squared (pseudo R2) 
+
+```
+
+## **3. Analyzing willingness to pay** {.tabset}
+
+### 3.a Interval regression models {.tabset}
+
+```{r running interval regression models, echo = FALSE, message= FALSE, warning= FALSE}
+
+# setup a survival object that contains the censored intervals using the Surv function. Note the special event status code, 3, used for all observations indicating that all had interval censoring. 
+intervals <- with(interval_reg_db, Surv(wtp_lower, wtp_upper, event = rep(3, nrow(interval_reg_db)), type = "interval"))
+
+# estimate the models using the survreg function.
+
+models_int_reg <- list (
+  
+"int_tech" = survreg(intervals ~ sos + info + data_owned, data = interval_reg_db, dist = "gaussian"),
+"int" = survreg(intervals ~ sos + info + data_owned + education + gdp_prop, data = interval_reg_db, dist = "gaussian"),
+"int_1 " = survreg(intervals ~ sos + info + data_owned + education + years_fishing, data = interval_reg_db, dist = "gaussian"),
+"int_2 " = survreg(intervals ~ sos + info + data_owned + education + boat_length_m, data = interval_reg_db, dist = "gaussian"),
+"int_3" = survreg(intervals ~ sos + info + data_owned + education + boat_length_m + fishtech, data = interval_reg_db, dist = "gaussian"),
+"int_4" = survreg(intervals ~ sos + info + data_owned + education  + fishtech + gdp_prop, data = interval_reg_db, dist = "gaussian"),
+"int_5 " = survreg(intervals ~ sos + info + data_owned + education + years_fishing + fishtech, data = interval_reg_db, dist = "gaussian"),
+"int_6" = survreg(intervals ~ sos + info + data_owned + education + years_fishing + gdp_prop + fishtech, data = interval_reg_db, dist = "gaussian"),
+"int_7" = survreg(intervals ~ sos + info + data_owned + education +  fishtech, data = interval_reg_db, dist = "gaussian"),
+"int_8" = survreg(intervals ~ sos + info + data_owned + gdp_prop +  fishtech, data = interval_reg_db, dist = "gaussian"),
+"int_9 " = survreg(intervals ~ sos + info + data_owned + gdp_prop +  fishtech + boat_own, data = interval_reg_db, dist = "gaussian"),
+"int_10" = survreg(intervals ~ sos + info + data_owned + gdp_prop +  fishtech + fishing_organization, data = interval_reg_db, dist = "gaussian"), 
+"int_11" = survreg(intervals ~ sos + info + data_owned + gdp_prop +  fishtech + income_fishing, data = interval_reg_db, dist = "gaussian"),
+"int_12" = survreg(intervals ~ sos + info + data_owned + gdp_prop +  fishtech + rank_one, data = interval_reg_db, dist = "gaussian"),
+"int_13 " = survreg(intervals ~ sos + info + data_owned +  fishtech + rank_one + fishing_organization, data = interval_reg_db, dist = "gaussian"),
+"int_15" = survreg(intervals ~ sos + info + data_owned + rank_one + fishtech + education, data = interval_reg_db, dist = "gaussian"),
+"int_16 "= survreg(intervals ~ sos + info + data_owned + rank_one + fishtech + education + gdp_prop, data = interval_reg_db, dist = "gaussian"))
+
+# printing models 
+
+modelsummary(models_int_reg, estimate= "{estimate}{stars}")
+```
+
+
+### 3.b. Interval regression models with random effects by country {.tabset}
+
+```{r running interval regression models with random effects by country, echo = FALSE, message= FALSE, warning= FALSE}
+
+# estimate the models using the survreg function.
+
+models_country_re <- list (
+  
+"model_1" = survreg(intervals ~ sos + info + data_owned + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_2" = survreg(intervals ~ sos + info + data_owned + education + gdp_prop + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_3 " = survreg(intervals ~ sos + info + data_owned + education + years_fishing + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_4 " = survreg(intervals ~ sos + info + data_owned + education + boat_length_m + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_5" = survreg(intervals ~ sos + info + data_owned + education + boat_length_m + fishtech + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_6" = survreg(intervals ~ sos + info + data_owned + education  + fishtech + gdp_prop + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_7" = survreg(intervals ~ sos + info + data_owned + education + years_fishing + fishtech + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_8" = survreg(intervals ~ sos + info + data_owned + education + years_fishing + gdp_prop + fishtech + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_9" = survreg(intervals ~ sos + info + data_owned + education +  fishtech + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_10" = survreg(intervals ~ sos + info + data_owned + gdp_prop +  fishtech + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_11 " = survreg(intervals ~ sos + info + data_owned + gdp_prop +  fishtech + boat_own + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_12" = survreg(intervals ~ sos + info + data_owned + gdp_prop +  fishtech + fishing_organization + frailty(country), data = interval_reg_db, dist = "gaussian"), 
+"model_13" = survreg(intervals ~ sos + info + data_owned + gdp_prop +  fishtech + income_fishing + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_14" = survreg(intervals ~ sos + info + data_owned + gdp_prop +  fishtech + rank_one + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_15" = survreg(intervals ~ sos + info + data_owned +  fishtech + rank_one + fishing_organization + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_16" = survreg(intervals ~ sos + info + data_owned + rank_one + fishtech + education + frailty(country), data = interval_reg_db, dist = "gaussian"),
+"model_17 "= survreg(intervals ~ sos + info + data_owned + rank_one + fishtech + education + gdp_prop + frailty(country), data = interval_reg_db, dist = "gaussian"))
+
+# printing models with re by country
+
+cm <- c('info' = 'Privacy' ,
+        'sos'    = 'SOS',
+        'data_owned by industry' = "Data_industry",
+        'data_owned by goverment'= "Data_goverment",
+        'data_owned by fisher'= "Data_fisher",
+        'educationformal'= "Formal_education",
+        'educationhigher'= "Higher_education",
+        'gdp_prop' = "GDP",
+        "years_fishing" = "Years_fishing",
+        "boat_length_m" = "Boat_length",
+        "fishtech" = "Exposure_technology",
+        "boat_own" = "Boat_owner",
+        "fishing_organizationy" = "Organized",
+        "income_fishing" = "Income_fishing",
+        "rank_onepollution" = "Pollution",
+        "rank_oneweather"= "Weather",
+        "rank_oneiuu"= "IUU",
+        '(Intercept)' = 'Constant')
+
+modelsummary(models_country_re, estimate= "{estimate}{stars}", fmt = 2, coef_map = cm)
+
+
+```
+
+## **4. Simulations** {.tabset}
+
+Model key:
+
+info == 0 ~ "Anon",
+info == 1 ~ "Non-Anon"
+
+own == 1 ~ "Fishers",
+own == 2 ~ "Industry",
+own == 3 ~ "Government",
+own == 4 ~ "Public Access"
+
+sos == 0 ~ "No",
+sos == 1 ~ "Yes"
+
+We want to simulate 4 scenarios:
+
+1. Best package in the "worst community"
+2. Best package in the "best community"
+3. Worst package in the "worst community"
+4. Worst package in the "best community"
+
+Based off Table 4 in the GP report the best package is one with SOS functionality and generating anonymous-data owned by the government while the worst package presents no SOS functionality and non-anonymous data owned by the industry. Based off the interval regression model a village in which all fishers have been previously exposed to technology, have higher education and perceive corruption as the main problem would present the highest WTP. The lowest WTP would be observed in a village in which none fisher has been exposed to previous technology, have only non-formal education and perceive weather as the main threat to fishing. 
+
+```{r simulations of hypothetical villages with best and worst package, echo = FALSE, warning= FALSE, message= FALSE}
+
+# Simulation
+
+wtpmin <- -5.35
+
+fishtech <- c(0,1)
+education <- c("no_formal", "formal", "higher")
+rank_one <- c("corruption", "iuu", "pollution", "weather")
+
+# Data for hypothetical village with relatively favorable demographics
+
+good_vill_prob_edu <- c(0.05, 0.05, 0.9)
+good_vill_prob_fishtech <- c(0.1, 0.9)
+good_vill_prob_rank_one <- c(0.7, 0.1, 0.1, 0.1)
+
+# Data for hypothetical village with relatively unfavorable demographics
+
+bad_vill_prob_edu <- c(0.9, 0.05, 0.05)
+bad_vill_prob_fishtech <- c(0.9, 0.1)
+bad_vill_prob_rank_one <- c(0.1, 0.1, 0.1, 0.7)
+
+# Data frames for each village 
+
+good_vill <- data.frame(
+                  fishtech = sample(rep(fishtech, round(100*good_vill_prob_fishtech))),
+                  education = sample(rep(education, round(100*good_vill_prob_edu))),
+                  rank_one = sample(rep(rank_one, round(100*good_vill_prob_rank_one)))
+                  )
+
+bad_vill <- data.frame(
+                  fishtech = sample(rep(fishtech, round(100*bad_vill_prob_fishtech))),
+                  education = sample(rep(education, round(100*bad_vill_prob_edu))),
+                  rank_one = sample(rep(rank_one, round(100*bad_vill_prob_rank_one)))
+                  )
+
+
+## building data frames for best package 
+
+good_vill_best_package <- good_vill %>% 
+  mutate(
+    sos = 1,
+    info = 0, 
+    own = as.factor(1)
+  )
+
+bad_vill_best_package <- bad_vill %>% 
+  mutate(
+    sos = 1,
+    info = 0, 
+    own = as.factor(1)
+  )
+
+
+## building data frames for worst package 
+
+good_vill_worst_package <- good_vill %>% 
+  mutate(
+    sos = 0,
+    info = 1, 
+    own = as.factor(4)
+  )
+
+bad_vill_worst_package <- bad_vill %>% 
+  mutate(
+    sos = 0,
+    info = 1, 
+    own = as.factor(4)
+  )
+
+
+# Loading most parsimonious interval regression model
+ 
+load(here("int_15.rda"))
+
+# Predicting WTP for each fisher and package based on interval regression model
+
+good_vill_predict_best_package <- data.frame(good_vill_best_package, int_15_wtp = predict(int_15, newdata = good_vill_best_package)) 
+bad_vill_predict_best_package <- data.frame(bad_vill_best_package, int_15_wtp = predict(int_15, newdata = bad_vill_best_package)) 
+good_vill_predict_worst_package <- data.frame(good_vill_worst_package, int_15_wtp = predict(int_15, newdata = good_vill_worst_package)) 
+bad_vill_predict_worst_package <- data.frame(bad_vill_worst_package, int_15_wtp = predict(int_15, newdata = bad_vill_worst_package)) 
+
+# Creating payment sequence
+
+dollar_values <- seq(-3, 9, by = 0.01)
+
+# Defining who opts in and out
+
+graph_good_vill_best_package_df <- good_vill_predict_best_package %>%
+  merge(dollar_values) %>%
+  mutate(opt_in_int = ifelse(int_15_wtp > y, 1, 0 )) %>% ## if the wtp is greater than payment value, then they will opt in, otherwise, opt out
+  group_by(y) %>%
+  summarise(perc = sum(opt_in_int)/n())
+
+  
+graph_bad_vill_best_package_df <- bad_vill_predict_best_package %>%
+  merge(dollar_values) %>%
+  mutate(opt_in_int = ifelse(int_15_wtp > y, 1, 0 )) %>% ## if the wtp is greater than payment value, then they will opt in, otherwise, opt out
+  group_by(y) %>%
+  summarise(perc = sum(opt_in_int)/n())
+
+graph_good_vill_worst_package_df <- good_vill_predict_worst_package %>%
+  merge(dollar_values) %>%
+  mutate(opt_in_int = ifelse(int_15_wtp > y, 1, 0 )) %>% ## if the wtp is greater than payment value, then they will opt in, otherwise, opt out
+  group_by(y) %>%
+  summarise(perc = sum(opt_in_int)/n())
+
+graph_bad_vill_worst_package_df <- bad_vill_predict_worst_package %>%
+  merge(dollar_values) %>%
+  mutate(opt_in_int = ifelse(int_15_wtp > y, 1, 0 )) %>% ## if the wtp is greater than payment value, then they will opt in, otherwise, opt out
+  group_by(y) %>%
+  summarise(perc = sum(opt_in_int)/n())
+
+graph_db <- graph_good_vill_best_package_df %>% 
+  left_join(graph_bad_vill_best_package_df, by = "y") %>% 
+  left_join(graph_good_vill_worst_package_df, by = "y") %>% 
+  left_join(graph_bad_vill_worst_package_df, by = "y") %>% 
+  rename(
+    payment = y,
+    good_vill_best_package = perc.x, 
+    bad_vill_best_package = perc.y,
+    good_vill_worst_package = perc.x.x,
+    bad_vill_worst_package = perc.y.y
+    
+  ) %>% 
+  gather(key = simulation, value= perc, -payment) %>% 
+  mutate(simulation = fct_relevel(simulation, "good_vill_best_package", 
+                                  "good_vill_worst_package", 
+                                  "bad_vill_best_package", 
+                                  "bad_vill_worst_package" ),
+         Fishing_community = ifelse(simulation == "good_vill_best_package" | simulation == "good_vill_worst_package", "Favorable fishers' characteristics", "Unfavorable fishers' characteristics"),
+         VTS_program = ifelse(simulation == "good_vill_best_package" | simulation == "bad_vill_best_package", "Most preferred attributes", "Least preferred attributes"))
+
+# Plots 
+
+all_comm_package <- ggplot(data = graph_db, aes(x = payment, y = perc*100, col= VTS_program, linetype =  Fishing_community)) +
+    geom_line(size = 1.05) +
+    scale_colour_manual(values = c("indianred1", "steelblue"))+
+    labs(x = "Cost to fisher (USD/month)", y = "Percentage of VTS adoption") +
+    theme_classic() +
+    theme(
+    legend.title = element_text(size = 7),
+    legend.text = element_text(size = 7)
+  )+
+    scale_x_continuous(expand = c(0, 0), breaks = seq(-3,9, 1)) +
+    scale_y_continuous(expand = c(0, 0), breaks = seq(0,100,20))
+
+all_comm_package
+
+ggsave("Fig2.jpg", plot = all_comm_package, device = "jpg", scale = 1, width = 14, height = 8, units = "cm", dpi = 600, limitsize = TRUE)
+```
+
