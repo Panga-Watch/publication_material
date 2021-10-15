@@ -16,10 +16,11 @@ __Correspondence to:__ Juan Silva, Bren School of Environmental Science and Mana
 
 This repository contains all the necessary material (i.e. data and code) to reproduce the results in the manuscript titled "Assessing the drivers of vessel tracking systems adoption for improved small-scale fisheries management". 
 
-Here follows an overview of the folders in this repository:
+Here follows an overview of the folders and files in this repository:
 
-**1. Data**: stores the data from our surveys in .csv format.
+**1. Data**: stores the datasets in .csv format. The database called "master_survey_resp.cvs" contains the responses to our survey, teh databse called "data_clogit.cvs" is the data from our choice experiment formated to run conditional logistic models, and the database called "data_int_regression" is the data from the bidding game formated to run interval regression models.
 
 **2. Scripts**: contains a .Rmd document to be run in R which reproduces the figures and analyses in our manuscript and generates a report in .html format. 
 
+**3. int_15**: contains a .rda file thats stores the most parsimonious interval regression model and is used to run the simulations of package adoption in hypothetical villages.
 
